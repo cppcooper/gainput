@@ -222,25 +222,37 @@ static void InitSystemNotificationReceiver(void* window)
 
         if (pUDevMonitor)
         {
-            udev_monitor_enable_receiving(pUDevMonitor);
-            gUDevFD = udev_monitor_get_fd(pUDevMonitor);
-            gNotifierInitialized = true;
+            if (udev_monitor_enable_receiving(pUDevMonitor) == 0)
+            {
+                gUDevFD = udev_monitor_get_fd(pUDevMonitor);
+                gNotifierInitialized = gUDevFD >= 0;
+            }
         }
+    }
+    if (!gNotifierInitialized)
+    {
+        if (pUDevMonitor)
+            udev_monitor_unref(pUDevMonitor);
+        if (pUDev)
+            udev_unref(pUDev);
+        pUDevMonitor = NULL;
+        pUDev = NULL;
+        gUDevFD = -1;
     }
 #endif
 
-
-    // backup timer system
-    if (!gNotifierInitialized)
-    {
-        initHiresTimer(&gForceRecheckTimer);
-    }
+    // Recheck even with notifications: failed opens may become readable without
+    // another arrival event, and notification delivery is not guaranteed.
+    initHiresTimer(&gForceRecheckTimer);
+    gLastCheck = 0;
 }
 
 static void ExitSystemNotificationReceiver()
 {
+#if !defined(__linux__)
     if (!gNotifierInitialized)
         return;
+#endif
 
 #if defined(_WINDOWS)
     GAINPUT_ASSERT(gNotifier && "gNotifierInitialized should have guaranteed this was not null.");
@@ -251,11 +263,13 @@ static void ExitSystemNotificationReceiver()
     IONotificationPortDestroy(gNotificationPort);
     gNotificationPort = NULL;
 #elif defined(__linux__)
-    GAINPUT_ASSERT(pUDev && pUDevMonitor && "gNotifierInitialized should have guaranteed these were not null.");
-    udev_monitor_unref(pUDevMonitor);
-    udev_unref(pUDev);
+    if (pUDevMonitor)
+        udev_monitor_unref(pUDevMonitor);
+    if (pUDev)
+        udev_unref(pUDev);
     pUDevMonitor = NULL;
     pUDev = NULL;
+    gUDevFD = -1;
 #endif
 
     gNotifierInitialized = false;
@@ -263,22 +277,17 @@ static void ExitSystemNotificationReceiver()
 
 static bool CheckForDeviceInstallation(void const* message)
 {
-    if (!gNotifierInitialized)
+    uint64_t currentTime = getHiresTimerUSec(&gForceRecheckTimer, false);
+    if (currentTime < gLastCheck)
+        gLastCheck = currentTime;
+    else if (currentTime - gLastCheck >= 4000000ULL)
     {
-        uint64_t currentTime = getHiresTimerUSec(&gForceRecheckTimer, false);
-
-        // update every 4 seconds
-        if ((currentTime - gLastCheck) > 4e+9)
-        {
-            gDevicesChanged = true;
-            gLastCheck = currentTime;
-        }
-        // prevent a clock wrap around from locking out devices
-        else if (currentTime < gLastCheck)
-            gLastCheck = currentTime;
-
-        return false;
+        gDevicesChanged = true;
+        gLastCheck = currentTime;
     }
+
+    if (!gNotifierInitialized)
+        return false;
 
 #if defined(_WINDOWS)
     MSG const * msg = (MSG const*)message;
@@ -302,19 +311,16 @@ static bool CheckForDeviceInstallation(void const* message)
 #elif defined(__linux__)
     if (gUDevFD >= 0)
     {
-        struct pollfd pollFD;
+        struct pollfd pollFD = {};
         pollFD.fd = gUDevFD;
         pollFD.events = POLLIN;
 
-        if (poll(&pollFD, 1, 0) == 1)
+        if (poll(&pollFD, 1, 0) == 1 && (pollFD.revents & POLLIN))
         {
             gDevicesChanged = true;
-
-            // Can't leave yet, need to drain all events on the FD
             struct udev_device* udevDev;
-            while (poll(&pollFD, 1, 0) == 1)
-                if ((udevDev = udev_monitor_receive_device(pUDevMonitor)) != NULL)
-                    udev_device_unref(udevDev);
+            while ((udevDev = udev_monitor_receive_device(pUDevMonitor)) != NULL)
+                udev_device_unref(udevDev);
         }
     }
 #endif
@@ -338,6 +344,7 @@ int HIDInit(void* window)
 
     initHiresTimer(&gHIDTimer);
 
+    gDevicesChanged = true;
     gHIDInitialized = true;
 
     return 0;
@@ -352,6 +359,7 @@ int HIDExit()
 
     HIDExitDeviceTracking();
     ExitSystemNotificationReceiver();
+    gDeviceChangeCallback = NULL;
 
     if (hid_exit() != 0)
         return -1;
@@ -364,6 +372,8 @@ int HIDExit()
 static void HIDInitDeviceTracking()
 {
     memset(gDeviceBuffer, 0, sizeof(gDeviceBuffer));
+    gActiveDevices = 0;
+    gActiveSlots = 0;
 
     HIDDeviceInfo* it = gDeviceBuffer;
     HIDDeviceInfo* end = it + MAX_DEVICES_TRACKED - 1;
@@ -375,6 +385,7 @@ static void HIDInitDeviceTracking()
         it->id = idGen;
         it->next = it + 1;
     }
+    it->id = idGen;
     it->next = NULL;
 
     // set the HEAD
@@ -387,8 +398,9 @@ static void HIDExitDeviceTracking()
     HIDDeviceInfo * devEnd = devIt + gActiveSlots;
 
     for (; devIt < devEnd; ++devIt)
-        if (devIt->isOpen)
+        if (devIt->wasActive)
             HIDRemoveDevice(devIt);
+    HIDInitDeviceTracking();
 }
 
 void HIDSetDeviceChangeCallback(void (*deviceChange)(const char*, bool, int))
@@ -427,7 +439,9 @@ static void HIDAddDevice(hid_device_info *dev, uint8_t controllertype)
         //     dev->path);
         return;
     }
-    GAINPUT_ASSERT(strlen(dev->path) < MAX_PATH_LENGTH);
+    // Never truncate an identity or overflow the tracker's fixed path storage.
+    if (!dev->path || strlen(dev->path) >= MAX_PATH_LENGTH)
+        return;
 
     // LOGF(LogLevel::eDEBUG, "Adding controller \"%ls - %ls\" at path: %s",
     //     dev->manufacturer_string,
@@ -447,20 +461,20 @@ static void HIDAddDevice(hid_device_info *dev, uint8_t controllertype)
     strcpy(newDev->logicalSystemPath, dev->path);
 
     ++gActiveDevices;
+    uint32_t usedSlots = uint32_t(newDev - gDeviceBuffer) + 1;
+    if (usedSlots > gActiveSlots)
+        gActiveSlots = usedSlots;
 
     HIDLoadController(newDev->id, 0);
-
-	if(gDeviceChangeCallback && newDev->isOpen)
-		(*gDeviceChangeCallback)(ControllerName(newDev->type), true, newDev->id - 1 );
 }
 
 static void HIDRemoveDevice(HIDDeviceInfo *dev)
 {    
-    if(gDeviceChangeCallback)
-        (*gDeviceChangeCallback)(ControllerName(dev->type), false, dev->id - 1);
-    
-    if (dev->isOpen)
+    bool wasOpen = dev->isOpen;
+    if (wasOpen)
         HIDUnloadController(dev->id);
+    if (gDeviceChangeCallback && wasOpen)
+        (*gDeviceChangeCallback)(ControllerName(dev->type), false, dev->id - 1);
 
     dev->next = pFreeList;
     pFreeList = dev;
@@ -475,91 +489,73 @@ static void HIDRemoveDevice(HIDDeviceInfo *dev)
     --gActiveDevices;
 }
 
+static HIDDeviceInfo* HIDFindDevice(const hid_device_info* dev)
+{
+    if (!dev->path)
+        return NULL;
+    for (uint32_t i = 0; i < gActiveSlots; ++i)
+    {
+        HIDDeviceInfo* tracked = gDeviceBuffer + i;
+        if (tracked->wasActive && tracked->vendorID == dev->vendor_id &&
+            tracked->productID == dev->product_id &&
+            strcmp(tracked->logicalSystemPath, dev->path) == 0)
+            return tracked;
+    }
+    return NULL;
+}
+
 static void HIDLoadDevices()
 {
-    // mark all devices inactive
     for (uint32_t i = 0; i < gActiveSlots; ++i)
         gDeviceBuffer[i].active = 0;
 
-    // get the list of all currently connect HID devices
-    hid_device_info *deviceList = hid_enumerate(0, 0);
-
-    if (deviceList)
+    hid_device_info* deviceList = hid_enumerate(0, 0);
+    for (hid_device_info* dev = deviceList; dev; dev = dev->next)
     {
-        hid_device_info* devicesToAdd = NULL;
-        hid_device_info* devicesToFree = NULL;
-
-        HIDDeviceInfo * devIt = gDeviceBuffer;
-        HIDDeviceInfo * devEnd = devIt + gActiveSlots;
-        hid_device_info* next = NULL;
-
-        // check which devices need to be added or removed
-        for (hid_device_info *it = deviceList; it; it = next)
-        {
-            next = it->next;
-
-            for (devIt = gDeviceBuffer; devIt < devEnd; ++devIt)
-                if (devIt->wasActive &&
-                    devIt->vendorID == it->vendor_id &&
-                    devIt->productID == it->product_id &&
-                    strcmp(devIt->logicalSystemPath, it->path))
-                    break;
-
-            if (devIt != devEnd)
-            {
-                devIt->active = 1;
-                it->next = devicesToFree;
-                devicesToFree = it;
-            }
-            else
-            {
-                it->next = devicesToAdd;
-                devicesToAdd = it;
-            }
-        }
-
-        // devices must be removed before new ones are added since gActiveSlots is
-        //   dependant on the list being as compact as possible
-        for (devIt = gDeviceBuffer; devIt < devEnd; ++devIt)
-            if (devIt->wasActive && !devIt->active)
-                HIDRemoveDevice(devIt);
-
-        // add any qualifying devices
-        for (hid_device_info* dev = devicesToAdd; dev; dev = dev->next)
-        {
-            if (!HIDIsController(dev))
-            {
-#if defined(HID_VERBOSE_LOGGING)
-                LOGF(LogLevel::eDEBUG, "Ignoring non-controller \"%ls - %ls\" at path: %s",
-                    dev->manufacturer_string,
-                    dev->product_string,
-                    dev->path);
-#endif
-                continue;
-            }
-
-            uint8_t type;
-            if (!HIDIsSupported(dev, &type))
-            {
-#if defined(HID_VERBOSE_LOGGING)
-                LOGF(LogLevel::eDEBUG, "Ignoring unsupported controller \"%ls - %ls\" at path: %s",
-                    dev->manufacturer_string,
-                    dev->product_string,
-                    dev->path);
-#endif
-                continue;
-            }
-
-            HIDAddDevice(dev, type);
-        }
-
-        if (gActiveDevices > gActiveSlots)
-            gActiveSlots = gActiveDevices;
-
-        // deviceList should have been cleanly divided between these two at this point
-        hid_free_enumeration(devicesToAdd);
-        hid_free_enumeration(devicesToFree);
+        HIDDeviceInfo* tracked = HIDFindDevice(dev);
+        if (tracked)
+            tracked->active = 1;
     }
+
+    // Empty enumeration also retires stale connections. Free removed slots before
+    // adding replacements so reconnect works when the tracker was at capacity.
+    for (uint32_t i = 0; i < gActiveSlots; ++i)
+        if (gDeviceBuffer[i].wasActive && !gDeviceBuffer[i].active)
+            HIDRemoveDevice(gDeviceBuffer + i);
+
+    // Retry unreadable controllers without announcing a connection before open.
+    for (uint32_t i = 0; i < gActiveSlots; ++i)
+        if (gDeviceBuffer[i].active && !gDeviceBuffer[i].isOpen)
+            HIDLoadController(gDeviceBuffer[i].id, 0);
+
+    for (hid_device_info* dev = deviceList; dev; dev = dev->next)
+    {
+        if (HIDFindDevice(dev))
+            continue;
+        if (!HIDIsController(dev))
+        {
+#if defined(HID_VERBOSE_LOGGING)
+            LOGF(LogLevel::eDEBUG, "Ignoring non-controller \"%ls - %ls\" at path: %s",
+                dev->manufacturer_string,
+                dev->product_string,
+                dev->path);
+#endif
+            continue;
+        }
+        uint8_t type;
+        if (!HIDIsSupported(dev, &type))
+        {
+#if defined(HID_VERBOSE_LOGGING)
+            LOGF(LogLevel::eDEBUG, "Ignoring unsupported controller \"%ls - %ls\" at path: %s",
+                dev->manufacturer_string,
+                dev->product_string,
+                dev->path);
+#endif
+            continue;
+        }
+        HIDAddDevice(dev, type);
+    }
+    hid_free_enumeration(deviceList);
 }
 
 // Currently only detects controllers
@@ -579,7 +575,8 @@ static void HIDDetectDevices()
 
 bool HIDHandleSystemMessage(void const* message)
 {
-    GAINPUT_ASSERT(gHIDInitialized);
+    if (!gHIDInitialized)
+        return false;
 
     bool result = false;
 #if defined(_WINDOWS)
@@ -605,14 +602,14 @@ bool HIDControllerConnected(uint8_t index)
     if (index >= gActiveSlots)
         return false;
 
-    return gDeviceBuffer[index].active;
+    return gDeviceBuffer[index].active && gDeviceBuffer[index].isOpen;
 }
 
 
 uint8_t HIDGetNextNewControllerID(uint8_t* outPlatform, uint16_t* outVendorID, uint16_t* outproductID)
 {
     if (!gActiveSlots)
-        return -1;
+        return INVALID_DEV_ID;
 
     static uint8_t i = 0;
     if (i >= gActiveSlots)
@@ -641,7 +638,8 @@ uint8_t HIDGetNextNewControllerID(uint8_t* outPlatform, uint16_t* outVendorID, u
 
 static void HIDInitControllerTracking()
 {
-    memset((void *)gControllerBuffer, 0, sizeof(gControllerBuffer));
+    for (uint32_t i = 0; i < MAX_DEVICES_TRACKED; ++i)
+        gControllerBuffer[i] = HIDController{};
 }
 
 static inline void UnsupportedControllerDebug(HIDDeviceInfo* dev, char const* brand)
@@ -676,7 +674,7 @@ void HIDLoadController(uint8_t devID, uint8_t playerNum)
     GAINPUT_ASSERT(devID > 0 && devID <= MAX_DEVICES_TRACKED);
     uint8_t index = devID - 1;
 
-    if (!gDeviceBuffer[index].active)
+    if (!gDeviceBuffer[index].active || gDeviceBuffer[index].isOpen)
     {
         // LOGF(LogLevel::eWARNING, "Tried to load non-existant device at index %i", index);
         return;
@@ -715,11 +713,13 @@ void HIDLoadController(uint8_t devID, uint8_t playerNum)
         SuccessfulOpenDebug(dev, name);
         break;
     default:
-        break;
+        return;
     }
 
     GAINPUT_ASSERT(con->Close && con->Update && "All controllers must set update & close methods.");
     dev->isOpen = 1;
+    if (gDeviceChangeCallback)
+        (*gDeviceChangeCallback)(name, true, index);
 }
 
 void HIDUnloadController(uint8_t devID)
@@ -728,6 +728,7 @@ void HIDUnloadController(uint8_t devID)
     uint8_t index = devID - 1;
 
     HIDController* con = gControllerBuffer + index;
+    gDeviceBuffer[index].isOpen = 0;
     if (!con->hidDev)
     {
         // LOGF(LogLevel::eWARNING, "Tried to unload non-existant controller at index %i", index);
@@ -740,7 +741,7 @@ void HIDUnloadController(uint8_t devID)
     con->hidDev = NULL;
 
     // wipe data
-    memset((void *)con, 0, sizeof *con);
+    *con = HIDController{};
 }
 
 
@@ -815,29 +816,33 @@ void HIDDoRumble(uint8_t devID, float leftFlt, float rightFlt, uint32_t duration
 
 static void HIDUpdateDevices(gainput::InputDeltaState * state)
 {
-    HIDController * conIt = gControllerBuffer;
-    HIDController * conEnd = conIt + gActiveSlots;
-    for (; conIt < conEnd; ++conIt)
-        if (conIt->hidDev)
+    for (uint32_t i = 0; i < gActiveSlots; ++i)
+    {
+        HIDController* con = gControllerBuffer + i;
+        if (!con->hidDev)
+            continue;
+        if (con->Update(con, state) < 0)
         {
-            conIt->Update(conIt, state);
-
-            if (conIt->rumbleEndTime &&
-                conIt->rumbleEndTime <= getHiresTimerUSec(&gHIDTimer, false) / 1000000UL)
-            {
-                conIt->DoRumble(conIt, 0, 0);
-                conIt->rumbleEndTime = 0;
-            }
+            HIDRemoveDevice(gDeviceBuffer + i);
+            gDevicesChanged = true;
+            continue;
         }
+        if (con->rumbleEndTime &&
+            con->rumbleEndTime <= getHiresTimerUSec(&gHIDTimer, false) / 1000000UL)
+        {
+            con->DoRumble(con, 0, 0);
+            con->rumbleEndTime = 0;
+        }
+    }
 }
 
 void HIDPromptForDeviceStateReports(gainput::InputDeltaState * state)
 {
-    GAINPUT_ASSERT(gHIDInitialized);
+    if (!gHIDInitialized)
+        return;
 
-    HIDUpdateDevices(state);
-
-    // Don't want to risk device connection events being intermixed with input 
-    //   events from the same devices
+    // Connection changes precede this poll's reports. A read failure retires its
+    // handle now and can only reopen during a later poll.
     HIDDetectDevices();
+    HIDUpdateDevices(state);
 }

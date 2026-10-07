@@ -1,9 +1,10 @@
 # HID and adaptive-trigger handoff
 
-This is deferred work for a future Codex session launched from the Cheryl checkout.
+This is the active Linux HID plan for work from the Cheryl checkout.
 Work on the existing `extern/gainput` submodule; do not clone another copy. The goal
 is reliable Sony controller HID integration followed by usable DualSense adaptive
-triggers in Cheryl. Creating this handoff does not start that implementation.
+triggers in Cheryl. The [integration contracts](HID.md) define the selected identity,
+source and feedback design; unfinished phases below do not advertise capabilities.
 
 ## Start here
 
@@ -55,8 +56,9 @@ the pad API is commented out. DualSense trigger packet fields exist, but
 `HIDDoRumbleTriggersPS5Controller` is an empty disabled stub.
 
 The initial end-to-end target is DualSense input and adaptive triggers on Linux over
-USB and Bluetooth. Resolve shared design and platform build constraints early;
-track Windows/macOS acceptance separately according to available machines. Touch,
+USB and Bluetooth. Windows/macOS/other-platform testing is shelved in Cheryl's
+[long-term platform plan](../../docs/planning/platform-acceptance.md). Shared contracts
+remain portable, but Linux development does not wait for those platforms. Touch,
 motion, battery exposure and other DualSense features need their own accepted
 contracts before being advertised. Both existing parsers route each touch contact's
 X/Y through one axis ID; retain that discovered correction as follow-on work if it
@@ -71,40 +73,42 @@ Resolve invalidated assumptions and required correctness work before accumulatin
 dependent implementation. Distinguish source completion from executable acceptance;
 keep deferred execution visible in the testing queue.
 
-### 1. Settle controller identity, source selection and feature contracts
+The connection-tracker prerequisite precedes phases 2–3. Source fixes and synthetic
+coverage are submitted for acceptance; runtime activation waits until pad identity,
+state and source selection agree.
 
-Define how an enumerated HID controller associates with a real `InputDevicePad`,
-including connection identity, assigned `DeviceId`, supported controls and output
-capabilities. Use IDs returned by normal device creation; do not reserve ID `4`,
-insert dummy devices or teach Cheryl to compensate for the parser's hardcoded ID.
+### Active foundation: contracts and connection lifecycle
 
-Select one reporting source for each physical controller. Define native fallback
-behavior when HID is disabled, unsupported or cannot initialize/open the device.
-Two sources must not double-count presses, and input/output must address the same
-controller. Keep the supported single native-owner lifetime and borrowed-window
-rules; broader multi-manager support is a separate task.
-
-Before dependent implementation, define the adaptive-trigger effect API, unsupported
-result, command ownership, clear behavior and how it maps into Cheryl. Its portable
-contract must not require games to construct Sony's raw output packet.
+- [x] Inspect native/HID ownership and select pad identity, physical association,
+  fallback, connection generations and portable feedback contracts in [HID.md](HID.md).
+- [x] Correct exact-path tracking, empty enumeration, slot/counter reset and capacity
+  handling; close failed connections and retry failed opens without phantom callbacks.
+- [x] Make Linux notification setup release partial resources and keep periodic
+  enumeration available after notification or open failures.
+- [x] Add an isolated runner with the real tracker/whitelist/Sony parsers and synthetic
+  transport, notification setup and time; retain HID-OFF joystick coverage.
+- [x] Submit the runner with the existing Linux automated request and reconcile
+  Cheryl's gitlink/current limits without enabling the unfinished report bridge.
+- [ ] Accept the lifecycle regressions through user-run Linux execution. Physical
+  report/state and trigger acceptance remain prerequisites of later phases.
 
 ### 2. Repair feature selection and startup/notification lifetime
 
 Start with [CMakeLists.txt](CMakeLists.txt), [lib/CMakeLists.txt](lib/CMakeLists.txt)
 and [InputManager](lib/source/gainput/GainputInputManager.cpp).
 
-Make the HID CMake selection, source/dependency selection and compiler guards agree
-for ON and OFF configurations. The current code uses `defined(GAINPUT_ENABLE_HID)`;
+Make the Linux HID CMake selection, source/dependency selection and compiler guards
+agree for ON and OFF configurations. The current code uses `defined(GAINPUT_ENABLE_HID)`;
 defining it to zero does not disable that guard. Linux Bluetooth requires hidapi's
 hidraw transport; verify the actual selected target, not a libusb include directory.
 
-Handle `HIDInit` failure and partial cleanup explicitly. Gate polling and Windows
-message dispatch on backend readiness, retain the original notification window,
-and release registration/resources at teardown. Windows currently calls the HID
-message handler independently of the startup guard and filters whitelisted Sony
+Handle `HIDInit` failure and partial cleanup explicitly. Gate manager polling on
+backend readiness. Windows message dispatch/readiness and the original notification
+window remain deferred platform work. Windows currently calls the HID message
+handler independently of the startup guard and filters whitelisted Sony
 pads out of DirectInput. The macOS native pad leaves Sony support to HID, while the
-Apple CMake branch omits the shared runtime/parsers. Resolve fallback ownership and
-platform source selection together before claiming those configurations work.
+Apple CMake branch omits the shared runtime/parsers. Resolve those platforms'
+fallback ownership/source selection before advertising them.
 
 ### 3. Integrate report state, availability and reconnection
 
@@ -117,9 +121,12 @@ Route reports to the associated pad, update its retained state and emit deltas u
 that pad's actual ID. Make availability and control validity agree with the selected
 HID source. Verify the manager's update order so retained held controls and listener
 transitions describe the same completed poll.
+Honor explicit pad indices while establishing those associations: the current pad
+constructor converts every non-`AutoIndex` index to zero. Independent pad bindings
+must not alias the first native joystick or an already-owned HID connection.
 
-Correct enumeration path equality, stale-device removal when enumeration becomes
-empty, and propagation of parser read failures. Disconnect releases held controls
+Use the tracker's exact-path, empty-enumeration and read-failure retirement behavior
+defined in [HID.md](HID.md). Disconnect releases held controls
 and invalidates the old connection; reconnect binds fresh state without delivering
 old input or output to a reused slot. Preserve native joystick behavior when selected.
 

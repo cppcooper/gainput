@@ -980,6 +980,12 @@ int HIDOpenPS5Controller(HIDDeviceInfo* devInfo, HIDController* controller, uint
     uint8_t data[PS5_PACKET_SIZE_BLUETOOTH_IN];
     // Get the current state
     int32_t size = hid_read_timeout(hidDev, data, PS5_PACKET_SIZE_BLUETOOTH_IN, 16);
+    if (size < 0)
+    {
+        HIDClosePS5Controller(controller);
+        *controller = HIDController{};
+        return -1;
+    }
 
     con->playerNum = playerNum;
     con->bluetooth = size != PS5_PACKET_SIZE_USB_IN ? 1 : 0;

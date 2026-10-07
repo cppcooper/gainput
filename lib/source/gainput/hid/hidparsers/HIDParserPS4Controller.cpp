@@ -542,6 +542,8 @@ static void HIDClosePS4Controller(HIDController* controller)
 int HIDOpenPS4Controller(HIDDeviceInfo* devInfo, HIDController* controller, uint8_t playerNum)
 {
     hid_device * hidDev = hid_open_path(devInfo->logicalSystemPath);
+    if (!hidDev)
+        return -1;
 
     // store the device
     controller->hidDev = hidDev;
