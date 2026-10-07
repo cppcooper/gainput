@@ -77,15 +77,13 @@ public:
 			event.type &= ~JS_EVENT_INIT;
 			if (event.type == JS_EVENT_AXIS)
 			{
-				GAINPUT_ASSERT(event.number < PadButtonAxisCount_);
-				DeviceButtonId buttonId = event.number;
+				if (!axisDialect_.count(event.number))
+				{
+					continue;
+				}
+				const DeviceButtonId buttonId = axisDialect_[event.number];
 
 				const float value = float(event.value)/MaxAxisValue;
-
-				if (axisDialect_.count(buttonId))
-				{
-					buttonId = axisDialect_[buttonId];
-				}
 
 				if (buttonId == PadButtonUp)
 				{
@@ -104,7 +102,6 @@ public:
 			}
 			else if (event.type == JS_EVENT_BUTTON)
 			{
-				GAINPUT_ASSERT(event.number < PadButtonCount_);
 				if (buttonDialect_.count(event.number))
 				{
 					DeviceButtonId buttonId = buttonDialect_[event.number];
@@ -128,6 +125,8 @@ public:
 #ifdef GAINPUT_DEBUG
 			GAINPUT_LOG("Pad lost.\n");
 #endif
+			ClearState(delta);
+			close(fd_);
 			deviceState_ = InputDevice::DS_UNAVAILABLE;
 			fd_ = -1;
 		}
@@ -183,6 +182,93 @@ private:
 	HashMap<unsigned, DeviceButtonId> buttonDialect_;
 	HashMap<unsigned, DeviceButtonId> axisDialect_;
 
+	void ClearState(InputDeltaState* delta)
+	{
+		for (unsigned i = 0; i < PadButtonAxisCount_; ++i)
+		{
+			if (state_.GetFloat(i) != 0.0f)
+			{
+				HandleAxis(device_, state_, delta, i, 0.0f);
+			}
+		}
+		for (unsigned i = PadButtonStart; i < PadButtonMax_; ++i)
+		{
+			if (state_.GetBool(i))
+			{
+				HandleButton(device_, state_, delta, i, false);
+			}
+		}
+	}
+
+	void MapKernelControls()
+	{
+		// Event numbers are positions in the driver's maps, not gamepad controls.
+		unsigned char buttonCount = 0;
+		__u16 buttonCodes[KEY_MAX - BTN_MISC + 1] = {};
+		if (ioctl(fd_, JSIOCGBUTTONS, &buttonCount) >= 0
+			&& ioctl(fd_, JSIOCGBTNMAP, buttonCodes) >= 0)
+		{
+			for (unsigned i = 0; i < buttonCount; ++i)
+			{
+				DeviceButtonId buttonId;
+				switch (buttonCodes[i])
+				{
+				case BTN_SOUTH: buttonId = PadButtonA; break;
+				case BTN_EAST: buttonId = PadButtonB; break;
+				case BTN_WEST: buttonId = PadButtonX; break;
+				case BTN_NORTH: buttonId = PadButtonY; break;
+				case BTN_TL: buttonId = PadButtonL1; break;
+				case BTN_TR: buttonId = PadButtonR1; break;
+				case BTN_TL2: buttonId = PadButtonL2; break;
+				case BTN_TR2: buttonId = PadButtonR2; break;
+				case BTN_SELECT: buttonId = PadButtonSelect; break;
+				case BTN_START: buttonId = PadButtonStart; break;
+				case BTN_MODE: buttonId = PadButtonHome; break;
+				case BTN_THUMBL: buttonId = PadButtonL3; break;
+				case BTN_THUMBR: buttonId = PadButtonR3; break;
+				case BTN_DPAD_LEFT: buttonId = PadButtonLeft; break;
+				case BTN_DPAD_RIGHT: buttonId = PadButtonRight; break;
+				case BTN_DPAD_UP: buttonId = PadButtonUp; break;
+				case BTN_DPAD_DOWN: buttonId = PadButtonDown; break;
+				default: continue;
+				}
+				buttonDialect_[i] = buttonId;
+			}
+		}
+
+		unsigned char axisCount = 0;
+		__u8 axisCodes[ABS_CNT] = {};
+		if (ioctl(fd_, JSIOCGAXES, &axisCount) >= 0
+			&& axisCount <= ABS_CNT
+			&& ioctl(fd_, JSIOCGAXMAP, axisCodes) >= 0)
+		{
+			axisDialect_.clear();
+			for (unsigned i = 0; i < axisCount; ++i)
+			{
+				DeviceButtonId buttonId;
+				switch (axisCodes[i])
+				{
+				case ABS_X: buttonId = PadButtonLeftStickX; break;
+				case ABS_Y: buttonId = PadButtonLeftStickY; break;
+				case ABS_RX: buttonId = PadButtonRightStickX; break;
+				case ABS_RY: buttonId = PadButtonRightStickY; break;
+				case ABS_Z: buttonId = PadButtonAxis4; break;
+				case ABS_RZ: buttonId = PadButtonAxis5; break;
+				case ABS_HAT0X:
+					buttonId = PadButtonLeft;
+					axisDialect_[unsigned(-2)] = PadButtonRight;
+					break;
+				case ABS_HAT0Y:
+					buttonId = PadButtonUp;
+					axisDialect_[unsigned(-1)] = PadButtonDown;
+					break;
+				default: continue;
+				}
+				axisDialect_[i] = buttonId;
+			}
+		}
+	}
+
 	void CheckForDevice()
 	{
 		if (fd_ != -1)
@@ -218,6 +304,8 @@ private:
 		GAINPUT_LOG("Name: %s\n", name);
 #endif
 
+		buttonDialect_.clear();
+		axisDialect_.clear();
 		for (unsigned i = PadButtonLeftStickX; i < PadButtonAxisCount_; ++i)
 		{
 			axisDialect_[i] = i;
@@ -279,6 +367,10 @@ private:
 			// Dummy entries for IsValidButton
 			axisDialect_[-1] = PadButtonDown;
 			axisDialect_[-2] = PadButtonRight;
+		}
+		else
+		{
+			MapKernelControls();
 		}
 
 		deviceState_ = InputDevice::DS_OK;
