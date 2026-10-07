@@ -33,10 +33,14 @@ commands. Keep normal builds free of deliberately triggered compiler warnings.
 The Linux joystick correction is commit
 `dd3f7468bfd7c7042aa885a38276516e9a364f00`. It translates kernel button/axis maps for
 unknown controller dialects, updates the created pad's state and device ID, and
-clears/reloads state on disconnect/reconnect. Bluetooth DualSense button delivery
-is observed with HID disabled; the remaining physical-controller and automated
-coverage stays in the testing queue. Preserve this path as a separate usable input
-source and regression baseline.
+clears/reloads state on disconnect/reconnect. Bluetooth DualSense physical QA is
+accepted on Linux with HID disabled: mapped buttons/axes, A press behavior,
+off-center disconnect/reconnect, connected startup and attachment after startup in
+both runtimes. Automated joystick regressions remain in the testing queue. This
+does not accept USB or HID behavior. Preserve the joystick path as a separate
+usable input source and regression baseline; its reusable
+[controller checks](../../docs/development/native-desktop-checks.md#linux-joystick-controller-checks)
+retain the physical procedure.
 
 The original missing Cross/A button came from joystick translation. The earlier
 HID-enabled CMake selection did not define the compiler guard for HID startup and
