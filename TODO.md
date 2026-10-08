@@ -13,7 +13,7 @@ Use these documents for current contracts and outstanding acceptance:
 
 - [Native input lifetime and mapping](../../projects/modules/platform/native-glfw/README.md#input-lifetime-and-mapping).
 - [Controller backend limits and capability scope](../../projects/modules/platform/native-glfw/README.md#controller-backend-limits).
-- [Cheryl native input plan](../../docs/planning/develop-review-and-development-plan.md#native-input-lifetime-safety).
+- [Cheryl HID integration plan](../../docs/planning/develop-review-and-development-plan.md#deferred-hid-integration).
 - [User testing queue](../../docs/testing-requests.md).
 
 Gainput changes belong in this submodule. Adapter, portable API, demo, integration
@@ -36,8 +36,9 @@ unknown controller dialects, updates the created pad's state and device ID, and
 clears/reloads state on disconnect/reconnect. Bluetooth DualSense physical QA is
 accepted on Linux with HID disabled: mapped buttons/axes, A press behavior,
 off-center disconnect/reconnect, connected startup and attachment after startup in
-both runtimes. Automated joystick regressions remain in the testing queue. This
-does not accept USB or HID behavior. Preserve the joystick path as a separate
+both runtimes. Linux mapper/synthetic joystick regressions and native consumer/header
+checks are accepted with HID disabled. This does not accept USB or HID behavior.
+Preserve the joystick path as a separate
 usable input source and regression baseline; its reusable
 [controller checks](../../docs/development/native-desktop-checks.md#linux-joystick-controller-checks)
 retain the physical procedure.
